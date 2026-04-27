@@ -1,93 +1,98 @@
-#!/usr/bin/env groovy
-
 pipeline {
-    environment{
-       FEATURE_NAME = BRANCH_NAME.replaceAll('[\\(\\)_/]','-').toLowerCase()
-       REGISTRY_PASSWORD = credentials('REGISTRY_PASSWORD')
-       REGISTRY_USERNAME = credentials('REGISTRY_USERNAME')
-       POSTGRES_PASSWORD = credentials('POSTGRES_PASSWORD')
-       APP_NAME = "cicd-demo"
+    agent any
+
+    environment {
+        IMAGE_NAME = 'mi-app:latest'
+        APP_CONTAINER = 'mi-app'
+        SONAR_HOST_URL = 'http://sonarqube:9000'
+        SONAR_PROJECT_KEY = 'mi-app'
     }
-    agent any 
+
     stages {
-        stage('Docker Build & Push') {
+        stage('Checkout') {
             steps {
-                sh "make dockerLogin build dockerBuild dockerPush"
-            }
-
-        }
-		// not in parallel due to race condition with .env
-        stage('Docker Scan') {
-            steps {
-                sh "make dockerScan"
-            }
-            post {
-                cleanup {
-                    sh "docker-compose down -v"
-                }
-            }
-        }
-        
-        stage('Parallel Tests') {
-            failFast true            
-            parallel {                  
-                stage('Static Code Analysis') {
-                    when {
-                        anyOf { branch 'master'; branch 'release'}
-                    }    
-                    steps {
-                        sh "make publishSonar"                        
-                    }
-                }
-                stage('Integration Tests') {
-                    steps {
-                        sh "make integrationTest"
-                    }
-                }
-            }
-        }
-        stage('Push Latest Tag') {
-            when { branch 'master' }
-            steps {
-                sh "make dockerPushLatest"
+                checkout scm
             }
         }
 
-        stage('Deploy To dev') {
-            environment { 
-                ENV = "dev"
-                APP_DNS = util.selectAppUrl(ENV, FEATURE_NAME, APP_NAME)
-                KUBE_SERVER = credentials("KUBE_API_SERVER")
-                KUBE_TOKEN = credentials("KUBE_DEV_TOKEN")
-            }
+        stage('Build') {
             steps {
-                sh "make kubeLogin deploy"
+                sh 'mvn clean package -DskipTests'
             }
         }
-        
-        stage('Deploy To qa') {
-            when { expression { BRANCH_NAME ==~ /(master|release-[0-9]+$)/ }} // Only Master and Release branches 
-            environment { 
-                ENV = "qa"
-                APP_DNS = util.selectAppUrl(ENV, FEATURE_NAME, APP_NAME)
-                KUBE_SERVER = credentials("KUBE_API_SERVER")
-                KUBE_TOKEN = credentials("KUBE_QA_TOKEN")
-            }
+
+        stage('Test') {
             steps {
-                sh "make kubeLogin deploy"
+                sh 'mvn test'
             }
         }
-        
+
+        stage('Docker Build') {
+            steps {
+                sh 'docker build -t ${IMAGE_NAME} .'
+            }
+        }
+
+        stage('Static Analysis (SonarQube)') {
+            steps {
+                withSonarQubeEnv('SonarQube') {
+                    sh 'mvn sonar:sonar -Dsonar.projectKey=${SONAR_PROJECT_KEY} -Dsonar.host.url=${SONAR_HOST_URL}'
+                }
+            }
+        }
+
+        stage('Quality Gate') {
+            steps {
+                timeout(time: 10, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+        }
+
+        stage('Security Hotspot Gate (SonarQube)') {
+            steps {
+                withSonarQubeEnv('SonarQube') {
+                    sh '''
+                        HOTSPOTS=$(curl -sS -u "${SONAR_AUTH_TOKEN}:" \
+                          "${SONAR_HOST_URL}/api/hotspots/search?projectKey=${SONAR_PROJECT_KEY}&status=TO_REVIEW")
+                        HOTSPOTS_COUNT=$(echo "$HOTSPOTS" | python3 -c "import json,sys; print(json.loads(sys.stdin.read()).get('paging',{}).get('total',0))")
+                        echo "Security Hotspots pendientes: ${HOTSPOTS_COUNT}"
+                        if [ "${HOTSPOTS_COUNT}" -gt 0 ]; then
+                          echo "Fallo por gate de seguridad: SonarQube detectó Security Hotspots pendientes."
+                          exit 1
+                        fi
+                    '''
+                }
+            }
+        }
+
+        stage('Container Security Scan (Trivy)') {
+            steps {
+                sh 'trivy image --severity CRITICAL --exit-code 1 --no-progress ${IMAGE_NAME}'
+            }
+        }
+
+        stage('Deploy') {
+            when {
+                anyOf {
+                    branch 'main'
+                    branch 'master'
+                }
+            }
+            steps {
+                sh 'docker rm -f ${APP_CONTAINER} || true'
+                sh 'docker run -d --name ${APP_CONTAINER} -p 80:8080 ${IMAGE_NAME}'
+            }
+        }
     }
+
     post {
+        failure {
+            echo 'Pipeline falló: revisar etapas de calidad/seguridad/build.'
+        }
         always {
-            script {
-                if(BRANCH_NAME ==~ /(master|release-[0-9]+$)/ ){
-                     util.notifySlack(currentBuild.result)
-                 }
-            }
-            archiveArtifacts artifacts: 'target/*.jar', fingerprint: true
-            junit 'target/surefire-reports/*.xml'
+            sh 'docker ps -aq -f name=${APP_CONTAINER} | xargs -r docker rm -f'
+            cleanWs()
         }
     }
 }
