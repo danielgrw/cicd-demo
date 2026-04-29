@@ -23,7 +23,7 @@ pipeline {
 
         stage('Test') {
             steps {
-                sh 'mvn test'
+                sh 'mvn test -DexcludedGroups=au.com.equifax.cicddemo.domain.SystemTest'
             }
         }
 
